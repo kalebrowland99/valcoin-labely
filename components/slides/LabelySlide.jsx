@@ -2,7 +2,11 @@
 
 import { useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { BAD_LABELY_SCORE, BAD_LABELY_VERDICT, MAX_BAD_LABELY_SCORE, MIN_BAD_LABELY_SCORE, clampLabelyScore } from "@/lib/labelyRating";
+import {
+  clampLabelyScore,
+  ratingLabelFromScore,
+  scoreAccent,
+} from "@/lib/labelyRating";
 import { resolveLabelyOutroText, shouldShowLabelyOutro } from "@/lib/labelyOutroText";
 
 const IPHONE_SCALE = 1080 / 390;
@@ -91,17 +95,31 @@ const LABELY_SUMMARY_VISIBLE_LINES = 2;
 
 const READ_MORE_SUFFIX = " Read more..";
 
-function LawsuitBubbleInner({ px }) {
+function LawsuitBubbleInner({ px, found, summary }) {
   const hereStyle = {
     textDecoration: "underline",
     textUnderlineOffset: px(2),
     textDecorationThickness: Math.max(1, px(1)),
   };
-  return (
-    <>
-      ⚠️ Lawsuits found. Tap <span style={hereStyle}>here</span> to view full report.
-    </>
-  );
+  if (found) {
+    return (
+      <>
+        ⚠️ {(summary || "Lawsuits found.").replace(/\.$/, "")}. Tap{" "}
+        <span style={hereStyle}>here</span> to view full report.
+      </>
+    );
+  }
+  return <>✓ {summary || "No lawsuits found."}</>;
+}
+
+function formatMetricBadge(items) {
+  const list = Array.isArray(items)
+    ? items.map((s) => String(s || "").trim()).filter(Boolean)
+    : [];
+  if (!list.length) return { label: "None", bad: false };
+  if (list.length === 1) return { label: list[0], bad: true };
+  if (list.length === 2) return { label: `${list[0]}, ${list[1]}`, bad: true };
+  return { label: `${list[0]} +${list.length - 1}`, bad: true };
 }
 
 /** Renders **bold** in analysis as strong (plain text otherwise). */
@@ -342,14 +360,19 @@ export default function LabelySlide({ slot, S, config, itemIndex = 0 }) {
 
   const name = (slot.itemName || "").trim() || "Product";
   const brand = (slot.labelyBrand || "").trim();
-  const storedScore = clampLabelyScore(slot.labelyScore);
-  const score = storedScore >= MIN_BAD_LABELY_SCORE && storedScore <= MAX_BAD_LABELY_SCORE ? storedScore : BAD_LABELY_SCORE;
-  const verdict = BAD_LABELY_VERDICT;
+  const score = clampLabelyScore(slot.labelyScore);
+  const verdict =
+    String(slot.labelyVerdict || "").trim() || ratingLabelFromScore(score);
+  const accent = scoreAccent(score);
   const analysisRaw =
     (slot.labelyAnalysis || "").trim()
-    || "Generate this slide from the sidebar to add a clean-ingredient analysis.";
-  const seedOils = "Dangerous";
-  const additives = "Dangerous";
+    || "Upload a product photo to generate a clean-ingredient analysis.";
+  const seedOilBadge = formatMetricBadge(slot.labelySeedOils);
+  const additiveBadge = formatMetricBadge(slot.labelyAdditives);
+  const lawsuitsFound = slot.labelyLawsuitsFound === true;
+  const lawsuitSummary =
+    String(slot.labelyLegalNote || "").trim() ||
+    (lawsuitsFound ? "Lawsuits found." : "No lawsuits found.");
   const productThumb = px(100);
   const productStyle = productImageStyle(config, itemIndex);
   const lawsuitBubbleStyle = {
@@ -361,14 +384,22 @@ export default function LabelySlide({ slot, S, config, itemIndex = 0 }) {
     flexShrink: 0,
     borderRadius: px(999),
     padding: `${px(8)}px ${px(16)}px`,
-    background: "#FFF9E6",
-    border: `${Math.max(1, px(1))}px solid #F2D26B`,
+    background: lawsuitsFound ? "#FFF9E6" : "#EEF7F0",
+    border: `${Math.max(1, px(1))}px solid ${lawsuitsFound ? "#F2D26B" : "#B7D8C0"}`,
     fontSize: px(11),
     fontWeight: 700,
-    color: "#5C4A12",
+    color: lawsuitsFound ? "#5C4A12" : "#2F5A41",
     lineHeight: 1.25,
     whiteSpace: "normal",
     boxShadow: `0 ${px(2)}px ${px(6)}px rgba(0,0,0,0.06)`,
+  };
+  const badPill = {
+    background: "#FFE9E2",
+    color: "#B23A2D",
+  };
+  const goodPill = {
+    background: "#E8F5EC",
+    color: "#2F5A41",
   };
 
   return (
@@ -433,13 +464,13 @@ export default function LabelySlide({ slot, S, config, itemIndex = 0 }) {
               ) : null}
 
               <div style={{ marginTop: px(10), display: "flex", alignItems: "center", gap: px(8) }}>
-                <div style={{ fontSize: px(16), fontWeight: 800, color: "#2F5A41", fontVariantNumeric: "tabular-nums" }}>
+                <div style={{ fontSize: px(16), fontWeight: 800, color: accent.text, fontVariantNumeric: "tabular-nums" }}>
                   {score}/100
                 </div>
-                <div style={{ fontSize: px(14), color: "#2F5A41", fontWeight: 600 }}>
+                <div style={{ fontSize: px(14), color: accent.text, fontWeight: 600 }}>
                   {verdict === "Great" ? "Excellent" : verdict}
                 </div>
-                <span style={{ width: px(10), height: px(10), borderRadius: "50%", background: "#E54D42", display: "inline-block", flexShrink: 0 }} />
+                <span style={{ width: px(10), height: px(10), borderRadius: "50%", background: accent.dot, display: "inline-block", flexShrink: 0 }} />
               </div>
             </div>
           </div>
@@ -507,7 +538,11 @@ export default function LabelySlide({ slot, S, config, itemIndex = 0 }) {
 
         <div style={{ flexShrink: 0, marginTop: px(18), paddingLeft: px(10), paddingRight: px(10), display: "flex", flexDirection: "column", gap: px(12) }}>
           <span style={lawsuitBubbleStyle}>
-            <LawsuitBubbleInner px={px} />
+            <LawsuitBubbleInner
+              px={px}
+              found={lawsuitsFound}
+              summary={lawsuitSummary}
+            />
           </span>
           {/* Healthier alternatives reveal */}
           <div style={{ background: "#ffffff", borderRadius: px(14), padding: `${px(12)}px ${px(14)}px`, display: "flex", alignItems: "center", justifyContent: "space-between", border: "1px solid rgba(0,0,0,0.04)" }}>
@@ -530,10 +565,24 @@ export default function LabelySlide({ slot, S, config, itemIndex = 0 }) {
                 Seed Oils
               </div>
             </div>
-            <div style={{ display: "flex", alignItems: "center", gap: px(10), flexShrink: 0 }}>
-              <div style={{ padding: `${px(6)}px ${px(12)}px`, borderRadius: px(999), background: "#FFE9E2", color: "#B23A2D", fontSize: px(12), fontWeight: 700, display: "inline-flex", alignItems: "center", gap: px(4) }}>
-                <span>{seedOils}</span>
-                <span aria-hidden>⚠️</span>
+            <div style={{ display: "flex", alignItems: "center", gap: px(10), flexShrink: 0, maxWidth: "58%" }}>
+              <div
+                style={{
+                  padding: `${px(6)}px ${px(12)}px`,
+                  borderRadius: px(999),
+                  ...(seedOilBadge.bad ? badPill : goodPill),
+                  fontSize: px(11),
+                  fontWeight: 700,
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: px(4),
+                  maxWidth: "100%",
+                }}
+              >
+                <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {seedOilBadge.label}
+                </span>
+                {seedOilBadge.bad ? <span aria-hidden>⚠️</span> : null}
               </div>
               <LabelyMetricDropdownChevron size={px(20)} />
             </div>
@@ -547,10 +596,24 @@ export default function LabelySlide({ slot, S, config, itemIndex = 0 }) {
                 Additives
               </div>
             </div>
-            <div style={{ display: "flex", alignItems: "center", gap: px(10), flexShrink: 0 }}>
-              <div style={{ padding: `${px(6)}px ${px(12)}px`, borderRadius: px(999), background: "#FFE9E2", color: "#B23A2D", fontSize: px(12), fontWeight: 700, display: "inline-flex", alignItems: "center", gap: px(4) }}>
-                <span>{additives}</span>
-                <span aria-hidden>⚠️</span>
+            <div style={{ display: "flex", alignItems: "center", gap: px(10), flexShrink: 0, maxWidth: "58%" }}>
+              <div
+                style={{
+                  padding: `${px(6)}px ${px(12)}px`,
+                  borderRadius: px(999),
+                  ...(additiveBadge.bad ? badPill : goodPill),
+                  fontSize: px(11),
+                  fontWeight: 700,
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: px(4),
+                  maxWidth: "100%",
+                }}
+              >
+                <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {additiveBadge.label}
+                </span>
+                {additiveBadge.bad ? <span aria-hidden>⚠️</span> : null}
               </div>
               <LabelyMetricDropdownChevron size={px(20)} />
             </div>

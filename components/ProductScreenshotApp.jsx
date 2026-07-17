@@ -10,12 +10,18 @@ import {
   IMAGE_FILE_ACCEPT,
 } from "@/lib/fileToDisplayableDataUrl";
 import { waitForPreviewPaint } from "@/lib/waitForPreviewPaint";
-import { clampLabelyScore, BAD_LABELY_SCORE, BAD_LABELY_VERDICT } from "@/lib/labelyRating";
+import {
+  clampLabelyScore,
+  ratingLabelFromScore,
+  hardenLabelyScore,
+} from "@/lib/labelyRating";
 import {
   pickValuableUSCoin,
   autoSoldListings,
   fallbackCoinPrices,
 } from "@/lib/valuableUsCoins";
+import { exportZoomVideo } from "@/lib/exportZoomVideo";
+import { isGoodLabelyScore } from "@/lib/scoreSounds";
 
 const PREVIEW_SCALE = 0.35; // 1080×1920 preview in the browser
 const EXPORT_ROOT_ID = "product-screenshot-root";
@@ -25,11 +31,14 @@ function emptyLabelySlot() {
     imageUrl: null,
     itemName: "",
     labelyBrand: "",
-    labelyScore: BAD_LABELY_SCORE,
-    labelyVerdict: BAD_LABELY_VERDICT,
+    labelyScore: 0,
+    labelyVerdict: "",
     labelyAnalysis: "",
     labelyAnalysisTitle: "Labely's Analysis",
     labelyLegalNote: "No lawsuits found.",
+    labelyLawsuitsFound: false,
+    labelySeedOils: [],
+    labelyAdditives: [],
     spentPrice: "",
     soldPrice: "",
     date: "",
@@ -129,6 +138,8 @@ export default function ProductScreenshotApp() {
   const [exporting, setExporting] = useState(false);
   const [status, setStatus] = useState("");
   const [error, setError] = useState("");
+  const [dragOver, setDragOver] = useState(false);
+  const dragDepthRef = useRef(0);
   const fileInputRef = useRef(null);
 
   const config = useMemo(
@@ -145,9 +156,12 @@ export default function ProductScreenshotApp() {
     setSlot(next === "labely" ? emptyLabelySlot() : emptyValcoinSlot());
     setError("");
     setStatus("");
+    setDragOver(false);
+    dragDepthRef.current = 0;
   }, []);
 
   const analyzeLabely = useCallback(async (imageDataUrl, uploadHint) => {
+    setStatus("Looking up full ingredients & additives, then ranking risks…");
     const res = await fetch("/api/labely", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -158,16 +172,24 @@ export default function ProductScreenshotApp() {
     });
     const json = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(json?.error || "Labely analysis failed");
+    const score = hardenLabelyScore(
+      json.score,
+      json.seedOils,
+      json.additives
+    );
     setSlot({
       ...emptyLabelySlot(),
       imageUrl: imageDataUrl,
       itemName: json.name || "Product",
       labelyBrand: json.brand || "",
-      labelyScore: clampLabelyScore(json.score ?? BAD_LABELY_SCORE),
-      labelyVerdict: BAD_LABELY_VERDICT,
+      labelyScore: score,
+      labelyVerdict: ratingLabelFromScore(score),
       labelyAnalysis: json.analysis || "",
       labelyAnalysisTitle: json.analysisTitle || "Labely's Analysis",
       labelyLegalNote: json.labelyLegalNote?.trim() || "No lawsuits found.",
+      labelyLawsuitsFound: json.lawsuitsFound === true,
+      labelySeedOils: Array.isArray(json.seedOils) ? json.seedOils : [],
+      labelyAdditives: Array.isArray(json.additives) ? json.additives : [],
     });
   }, []);
 
@@ -204,12 +226,10 @@ export default function ProductScreenshotApp() {
     });
   }, []);
 
-  const onPickFile = useCallback(
-    async (e) => {
-      const file = e.target.files?.[0];
-      e.target.value = "";
+  const processFile = useCallback(
+    async (file) => {
       if (!isLikelyRasterImageFile(file)) {
-        setError("Please choose a JPEG, PNG, WEBP, or HEIC photo.");
+        setError("Please drop a JPEG, PNG, WEBP, or HEIC photo.");
         return;
       }
       setBusy(true);
@@ -218,7 +238,7 @@ export default function ProductScreenshotApp() {
       try {
         const dataUrl = await fileToDisplayableDataUrl(file);
         if (brand === "labely") {
-          setStatus("Analyzing packaging…");
+          setStatus("Identifying brand & food type…");
           await analyzeLabely(dataUrl, file.name);
         } else {
           await analyzeValcoin(dataUrl, file.name);
@@ -235,6 +255,77 @@ export default function ProductScreenshotApp() {
     [analyzeLabely, analyzeValcoin, brand]
   );
 
+  const onPickFile = useCallback(
+    (e) => {
+      const file = e.target.files?.[0];
+      e.target.value = "";
+      if (file) void processFile(file);
+    },
+    [processFile]
+  );
+
+  const onDragEnter = useCallback(
+    (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (busy || exporting) return;
+      dragDepthRef.current += 1;
+      setDragOver(true);
+    },
+    [busy, exporting]
+  );
+
+  const onDragLeave = useCallback((e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+    if (dragDepthRef.current === 0) setDragOver(false);
+  }, []);
+
+  const onDragOver = useCallback((e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
+  }, []);
+
+  const onDrop = useCallback(
+    (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      dragDepthRef.current = 0;
+      setDragOver(false);
+      if (busy || exporting) return;
+      const file = e.dataTransfer?.files?.[0];
+      if (file) void processFile(file);
+    },
+    [busy, exporting, processFile]
+  );
+
+  const captureFullFrameDataUrl = useCallback(async () => {
+    const el = document.getElementById(EXPORT_ROOT_ID);
+    if (!el) throw new Error("Preview not ready");
+    await waitForPreviewPaint({ rootId: EXPORT_ROOT_ID });
+    await waitForImagesDecoded(el);
+    if (document.fonts?.ready) await document.fonts.ready;
+    const fontEmbedCSS = await getFontEmbedCSS(el);
+    return toPng(el, {
+      backgroundColor: brand === "labely" ? "#F4F0E6" : "#ffffff",
+      width: 1080,
+      height: 1920,
+      canvasWidth: 1080,
+      canvasHeight: 1920,
+      pixelRatio: 1,
+      cacheBust: false,
+      includeQueryParams: false,
+      style: {
+        transform: "none",
+        width: "1080px",
+        height: "1920px",
+      },
+      ...(fontEmbedCSS ? { fontEmbedCSS } : {}),
+    });
+  }, [brand]);
+
   const downloadPng = useCallback(async () => {
     if (!slot.imageUrl) {
       setError("Upload a photo first.");
@@ -244,24 +335,12 @@ export default function ProductScreenshotApp() {
     setError("");
     setStatus("Capturing screenshot…");
     try {
-      const el = document.getElementById(EXPORT_ROOT_ID);
-      if (!el) throw new Error("Preview not ready");
-      await waitForPreviewPaint({ rootId: EXPORT_ROOT_ID });
-      await waitForImagesDecoded(el);
-      if (document.fonts?.ready) await document.fonts.ready;
-      const fontEmbedCSS = await getFontEmbedCSS(el);
-      const dataUrl = await toPng(el, {
-        backgroundColor: brand === "labely" ? "#F4F0E6" : "#ffffff",
-        pixelRatio: 1 / PREVIEW_SCALE,
-        cacheBust: false,
-        includeQueryParams: false,
-        ...(fontEmbedCSS ? { fontEmbedCSS } : {}),
-      });
+      const dataUrl = await captureFullFrameDataUrl();
       const a = document.createElement("a");
       a.href = dataUrl;
       a.download = `${brand}-screenshot-${Date.now()}.png`;
       a.click();
-      setStatus("Downloaded.");
+      setStatus("Downloaded PNG.");
     } catch (err) {
       console.error("[product-screenshot] export failed", err);
       setError(err?.message || "Screenshot export failed.");
@@ -269,13 +348,75 @@ export default function ProductScreenshotApp() {
     } finally {
       setExporting(false);
     }
-  }, [brand, slot.imageUrl]);
+  }, [brand, captureFullFrameDataUrl, slot.imageUrl]);
+
+  const downloadVideo = useCallback(async () => {
+    if (!slot.imageUrl) {
+      setError("Upload a photo first.");
+      return;
+    }
+    setExporting(true);
+    setError("");
+    setStatus("Capturing frame…");
+    try {
+      const frameDataUrl = await captureFullFrameDataUrl();
+      const score =
+        brand === "labely"
+          ? clampLabelyScore(slot.labelyScore)
+          : (() => {
+              const spent = parseFloat(slot.spentPrice);
+              const sold = parseFloat(slot.soldPrice);
+              if (!Number.isFinite(spent) || !Number.isFinite(sold) || spent <= 0) return 70;
+              const ratio = sold / spent;
+              return ratio >= 1.3 ? 75 : 40;
+            })();
+
+      setStatus(
+        isGoodLabelyScore(score)
+          ? "Recording scan → slide-up + yay…"
+          : "Recording scan → slide-up + sound…"
+      );
+
+      const blob = await exportZoomVideo({
+        frameDataUrl,
+        productImageUrl: slot.imageUrl,
+        score,
+        brand,
+        seedOils: slot.labelySeedOils,
+        additives: slot.labelyAdditives,
+        analysisTitle: slot.labelyAnalysisTitle || "Labely's Analysis",
+        analysisText: slot.labelyAnalysis || "",
+        onProgress: (pct, phase, cueLabel) => {
+          if (phase === "encoding") {
+            setStatus(`Encoding MP4… ${pct}%`);
+            return;
+          }
+          const cue = cueLabel ? ` (${cueLabel})` : "";
+          setStatus(`Recording video… ${pct}%${cue}`);
+        },
+      });
+
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${brand}-zoom-${Date.now()}.mp4`;
+      a.click();
+      URL.revokeObjectURL(url);
+      setStatus("Downloaded MP4.");
+    } catch (err) {
+      console.error("[product-screenshot] video export failed", err);
+      setError(err?.message || "Video export failed.");
+      setStatus("");
+    } finally {
+      setExporting(false);
+    }
+  }, [brand, captureFullFrameDataUrl, slot]);
 
   const hasResult = Boolean(slot.imageUrl && (slot.itemName || slot.labelyAnalysis));
 
   return (
     <div className="min-h-screen bg-[#f6f4ef] text-[#1a1a1a]">
-      <header className="border-b border-black/8 bg-[#faf8f4]/
+      <header className="border-b border-black/8 bg-[#faf8f4]">
         <div className="mx-auto flex max-w-5xl items-center justify-between gap-4 px-5 py-4">
           <div>
             <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-[#8a7a68]">
@@ -317,20 +458,58 @@ export default function ProductScreenshotApp() {
           <h2 className="text-[18px] font-semibold tracking-tight">
             {brand === "labely" ? "Upload a food or drink pack shot" : "Upload a coin photo"}
           </h2>
-          <p className="mt-2 max-w-prose text-[14px] leading-relaxed text-[#5c5c5c]">
+          <p
+            className="mt-2 max-w-prose text-[14px] leading-relaxed text-[#5c5c5c]"
+            suppressHydrationWarning
+          >
             {brand === "labely"
-              ? "We read the packaging, fill a Labely product card, and you download a 1080×1920 PNG screenshot."
-              : "We fill a Valcoin product card (title, prices, sold listings) and you download a 1080×1920 PNG screenshot."}
+              ? "We identify the brand and food type, look up the full ingredients/additives list, extract and rank the unhealthy ones, then export a video."
+              : "We fill a Valcoin product card and export a scan → slide-up video with a profit-based sound cue."}
           </p>
 
-          <div className="mt-6 flex flex-wrap items-center gap-3">
+          <div
+            role="button"
+            tabIndex={0}
+            onClick={() => {
+              if (!busy && !exporting) fileInputRef.current?.click();
+            }}
+            onKeyDown={(e) => {
+              if ((e.key === "Enter" || e.key === " ") && !busy && !exporting) {
+                e.preventDefault();
+                fileInputRef.current?.click();
+              }
+            }}
+            onDragEnter={onDragEnter}
+            onDragLeave={onDragLeave}
+            onDragOver={onDragOver}
+            onDrop={onDrop}
+            aria-disabled={busy || exporting}
+            className={`mt-6 cursor-pointer rounded-2xl border-2 border-dashed px-5 py-10 text-center transition ${
+              dragOver
+                ? "border-[#2F5A41] bg-[#EEF4F0]"
+                : "border-black/15 bg-[#faf8f4] hover:border-black/30 hover:bg-[#f6f4ef]"
+            } ${busy || exporting ? "pointer-events-none opacity-60" : ""}`}
+          >
+            <p className="text-[15px] font-semibold text-[#1a1a1a]">
+              {busy
+                ? "Working…"
+                : dragOver
+                  ? "Drop photo to upload"
+                  : "Drag & drop a photo here"}
+            </p>
+            <p className="mt-2 text-[13px] text-[#8e8e93]">
+              or click to browse · JPEG, PNG, WEBP, HEIC
+            </p>
+          </div>
+
+          <div className="mt-4 flex flex-wrap items-center gap-3">
             <button
               type="button"
-              disabled={busy || exporting}
-              onClick={() => fileInputRef.current?.click()}
-              className="rounded-full bg-[#1a1a1a] px-5 py-2.5 text-[14px] font-semibold text-white disabled:opacity-50"
+              disabled={!hasResult || busy || exporting}
+              onClick={() => void downloadVideo()}
+              className="rounded-full bg-[#1a1a1a] px-5 py-2.5 text-[14px] font-semibold text-white disabled:opacity-40"
             >
-              {busy ? "Working…" : "Choose photo"}
+              {exporting ? "Exporting…" : "Download video"}
             </button>
             <button
               type="button"
@@ -338,14 +517,14 @@ export default function ProductScreenshotApp() {
               onClick={() => void downloadPng()}
               className="rounded-full border border-black/15 bg-white px-5 py-2.5 text-[14px] font-semibold text-[#1a1a1a] disabled:opacity-40"
             >
-              {exporting ? "Exporting…" : "Download screenshot"}
+              Download PNG
             </button>
             <input
               ref={fileInputRef}
               type="file"
               accept={IMAGE_FILE_ACCEPT}
               className="hidden"
-              onChange={(e) => void onPickFile(e)}
+              onChange={onPickFile}
             />
           </div>
 

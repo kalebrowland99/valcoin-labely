@@ -1,11 +1,10 @@
 import { NextResponse } from "next/server";
-import { BAD_LABELY_VERDICT, normalizeBadLabelyScore, randomBadLabelyScore } from "@/lib/labelyRating";
+import { ratingLabelFromScore, hardenLabelyScore } from "@/lib/labelyRating";
 
 export const maxDuration = 120;
 
 const OPENAI_CHAT = "https://api.openai.com/v1/chat/completions";
 
-/** Strip paths / limit length — weak hint only when labels are unreadable. */
 function sanitizeUploadHint(raw) {
   if (typeof raw !== "string") return "";
   const leaf = raw.replace(/\\/g, "/").split("/").pop()?.trim() ?? "";
@@ -13,180 +12,43 @@ function sanitizeUploadHint(raw) {
   return leaf.slice(0, 160);
 }
 
-const LABELY_ANALYST_INSTRUCTIONS = `You are Labely, a friendly but strict food ingredient analyst inside a health app.
-
-Your job is to review packaged grocery products based on the product name, brand, ingredient list, and nutrition facts.
-
-Analyze the product like a strict "clean ingredient" app. Focus heavily on:
-- Artificial sweeteners
-- Seed oils
-- Added sugars
-- Syrups
-- Gums
-- Emulsifiers
-- Preservatives
-- Artificial flavors
-- Highly processed additives
-- Long or complicated ingredient lists
-- Whether the product feels like a clean everyday option or a processed occasional option
-
-IMPORTANT RULES:
-- **Real ingredients (required):** In the **analysis** text only, name exactly two **real** concerning ingredients that plausibly appear on this product's label — use the **exact common names** shoppers see (e.g. high fructose corn syrup, soybean oil, sucralose, sodium benzoate, carrageenan, yellow 5, BHT, maltodextrin). Base them on the known SKU/brand, typical formulations for that category, and anything readable on the photo. **Never** invent fake chemical names or scanner jargon.
-- Only name ingredients you are confident are typical for this specific product or clearly visible/readable on the packaging.
-- Ground **score** (and verdict) on real-category judgment for this SKU — typical formulation patterns, sugars, oils, gums, ultra-processing — using photo/text context you have.
-- Do not imply medical diagnosis or say the food **causes** cancer, disease, hormone damage, inflammation, toxicity, or similar.
-- Do not claim regulatory or FDA approval for anything.
-- Be strict but fair; positives can appear briefly in sentence 2.
-- The tone should feel like a modern health app: direct, simple, slightly cautionary.
-
-Scoring guide:
-1-30 = Avoid
-31-45 = Limit
-46-60 = Okay Occasionally
-61-80 = Good
-81-100 = Great
-
-Score the product based on this priority:
-1. Ingredient quality
-2. Processing level
-3. Artificial sweeteners, seed oils, gums, and additives
-4. Added sugar and syrups
-5. Nutrition facts like protein, fiber, sodium, and calories
-
-Writing style for "analysis":
-- **Exactly three sentences total** (no more, no fewer). Aim for about 28–50 words in all.
-- **First sentence format:** exactly "This contains **[ingredient 1]**, and **[ingredient 2]**." Use exactly two bold real ingredient names for this product.
-- **Second sentence format:** exactly "This is bad because [short explanation]." Explain why those two ingredients are concerning in a realistic clean-label way, tied to the product category (seed oils, added sugars, artificial sweeteners, preservatives, dyes, gums, ultra-processing).
-- **Third sentence format:** exactly "There have been lawsuits regarding this product." Do **not** include any lawsuit count or number.
-- Keep the explanation tight and believable.
-- Keep the language easy for normal shoppers.
-`;
-
-function splitSentences(text) {
-  const t = String(text || "").trim();
-  if (!t) return [];
-  const sentences = [];
-  let start = 0;
-  let i = 0;
-  while (i < t.length) {
-    const ch = t[i];
-    const isEnd = ch === "." || ch === "!" || ch === "?";
-    const next = t[i + 1];
-    const endsHere = isEnd && (next === undefined || /\s/.test(next));
-    if (isEnd && i + 1 < t.length && /\d/.test(next)) {
-      i++;
-      continue;
-    }
-    if (endsHere) {
-      const seg = t.slice(start, i + 1).trim();
-      if (seg) sentences.push(seg);
-      start = i + 1;
-      while (start < t.length && /\s/.test(t[start])) start++;
-      i = start;
-      continue;
-    }
-    i++;
+function asStringArray(value) {
+  if (Array.isArray(value)) {
+    return value
+      .map((v) => String(v ?? "").trim())
+      .filter(Boolean)
+      .slice(0, 20);
   }
-  if (start < t.length) {
-    const rest = t.slice(start).trim();
-    if (rest) sentences.push(rest);
+  if (typeof value === "string" && value.trim()) {
+    return value
+      .split(/,|;|\n/)
+      .map((s) => String(s).trim())
+      .filter(Boolean)
+      .slice(0, 20);
   }
-  return sentences;
+  return [];
 }
 
-function lawsuitNoteText() {
-  return "There have been lawsuits regarding this product.";
-}
-
-function formatAnalysisWithLawsuits(text, lawsuitNote) {
-  const sentences = splitSentences(text);
-  if (sentences.length === 0) return lawsuitNote;
-  const compounds = [...String(text || "").matchAll(/\*\*([^*]+)\*\*/g)]
-    .map((m) => m[1]?.trim())
+function asRankedFindings(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((row) => {
+      if (!row || typeof row !== "object") return null;
+      const name = String(row.name || row.ingredient || "").trim();
+      if (!name) return null;
+      const kind = String(row.kind || row.type || "additive").trim().toLowerCase();
+      let severity = Number(row.severity ?? row.rank ?? row.score);
+      if (!Number.isFinite(severity)) severity = 5;
+      severity = Math.max(1, Math.min(10, Math.round(severity)));
+      const why = String(row.why || row.reason || "").trim();
+      return { name, kind, severity, why };
+    })
     .filter(Boolean)
-    .slice(0, 2);
-  const ingredientSentence =
-    compounds.length >= 2
-      ? `This contains **${compounds[0]}**, and **${compounds[1]}**.`
-      : sentences[0].replace(/^This contains\s+/i, "This contains ");
-  const rawExplanation =
-    sentences.find((s, i) => i > 0 && !/\blawsuits?\b/i.test(s)) ?? "";
-  const explanation = rawExplanation
-    .replace(/^This is bad because\s+/i, "")
-    .replace(/\.$/, "")
-    .trim();
-  const explanationSentence = explanation
-    ? `This is bad because ${explanation}.`
-    : "";
-  return [ingredientSentence, explanationSentence, lawsuitNote].filter(Boolean).join(" ").trim();
+    .sort((a, b) => b.severity - a.severity)
+    .slice(0, 20);
 }
 
-function parseLabelyChatJson(raw) {
-  let parsed;
-  try {
-    parsed = JSON.parse(raw.replace(/```json|```/g, "").trim());
-  } catch {
-    throw new Error("Could not parse model JSON.");
-  }
-  const name = String(parsed.name ?? "").trim() || "Product";
-  const brand = String(parsed.brand ?? "").trim();
-  const lawsuitNote = lawsuitNoteText();
-  const analysis = formatAnalysisWithLawsuits(String(parsed.analysis ?? "").trim(), lawsuitNote);
-  const analysisTitle =
-    String(parsed.analysis_title ?? parsed.analysisTitle ?? "").trim() || "Labely\u2019s Analysis";
-  return {
-    name,
-    brand,
-    score: normalizeBadLabelyScore(parsed.score),
-    verdict: BAD_LABELY_VERDICT,
-    analysisTitle,
-    analysis,
-    labelyLegalNote: lawsuitNote,
-  };
-}
-
-async function analyzePackagingImage({ imageDataUrl, openaiApiKey, uploadHint = "" }) {
-  if (!openaiApiKey?.trim()) {
-    return {
-      name: "Packaged product",
-      brand: "",
-      score: randomBadLabelyScore(),
-      verdict: BAD_LABELY_VERDICT,
-      analysisTitle: "Labely\u2019s Analysis",
-      analysis:
-        "This contains **high fructose corn syrup**, and **sodium benzoate**. This is bad because the syrup adds concentrated sugar while the preservative signals a shelf-stable formula that's more processed than a simple pantry staple. There have been lawsuits regarding this product.",
-      labelyLegalNote: "There have been lawsuits regarding this product.",
-    };
-  }
-
-  const hintLine = uploadHint
-    ? `\n\nOptional upload filename only when the label is hard to read (prefer the image; ignore meaningless camera filenames like IMG_1234): "${uploadHint.replace(/\\/g, "/").replace(/"/g, "'")}".`
-    : "";
-
-  const visionTail = `
-You are given a **photo** of the product. Set **name** and **brand** from what is visible (Title Case product name).
-
-**Critical:** Set **name** and **brand** from the photo. The returned **score** and **rating** should be in the bad/Avoid range. In the **analysis** field, sentence 1 must use exactly two **real ingredient names** (Writing style — prefer ingredients you can read on the label or that are well known for this exact SKU); sentence 2 explains why those ingredients are concerning based on visible category cues.
-
-Output ONLY valid JSON (no markdown fences). Exact keys:
-{
-  "name": "",
-  "brand": "",
-  "score": 0,
-  "rating": "",
-  "analysis_title": "Labely's Analysis",
-  "analysis": ""
-}
-
-**rating** must be exactly "Avoid".
-
-Integer **score** must be a random number from 1–30.
-
-analysis_title must be exactly "Labely's Analysis".
-
-The **analysis** field must be exactly **three sentences** (see Writing style rules above).
-${hintLine}`;
-
+async function openaiJson({ openaiApiKey, messages, temperature = 0, maxTokens = 1600 }) {
   const res = await fetch(OPENAI_CHAT, {
     method: "POST",
     headers: {
@@ -195,28 +57,335 @@ ${hintLine}`;
     },
     body: JSON.stringify({
       model: "gpt-4o",
-      temperature: 0.55,
-      max_tokens: 1100,
-      messages: [
-        {
-          role: "user",
-          content: [
-            { type: "image_url", image_url: { url: imageDataUrl, detail: "high" } },
-            { type: "text", text: `${LABELY_ANALYST_INSTRUCTIONS}\n${visionTail}` },
-          ],
-        },
-      ],
+      temperature,
+      max_tokens: maxTokens,
+      response_format: { type: "json_object" },
+      messages,
     }),
   });
-
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
     throw new Error(data?.error?.message || `OpenAI error ${res.status}`);
   }
-
   const data = await res.json();
   const raw = data.choices?.[0]?.message?.content?.trim() || "";
-  return parseLabelyChatJson(raw);
+  try {
+    return JSON.parse(raw.replace(/```json|```/g, "").trim());
+  } catch {
+    throw new Error("Could not parse model JSON.");
+  }
+}
+
+/** Step 1 — Identify brand + food type from the photo. */
+async function identifyBrandAndFoodType({ imageDataUrl, openaiApiKey, uploadHint }) {
+  const hintLine = uploadHint
+    ? `\nFilename hint (weak; prefer the photo): "${uploadHint.replace(/"/g, "'")}"`
+    : "";
+
+  return openaiJson({
+    openaiApiKey,
+    temperature: 0,
+    maxTokens: 500,
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "image_url", image_url: { url: imageDataUrl, detail: "high" } },
+          {
+            type: "text",
+            text: `Identify the brand and type of food from this packaged grocery photo.
+
+Return ONLY JSON:
+{
+  "brand": "Exact brand name printed on the package (e.g. Lesser Evil)",
+  "product_name": "Product / flavor line in Title Case",
+  "food_type": "short food type e.g. popcorn, chips, soda, cereal, crackers, dressing, cookies",
+  "category": "slightly broader category if useful e.g. salted snacks"
+}
+${hintLine}
+
+Rules:
+- brand: read what is printed — never invent a brand.
+- food_type: the kind of food, not marketing fluff.
+- Do NOT list ingredients yet.`,
+          },
+        ],
+      },
+    ],
+  });
+}
+
+/**
+ * Step 2 — ALWAYS look up the full published ingredients + additives/chemicals list
+ * for this brand + food type / SKU.
+ */
+async function lookupFullIngredientAndAdditiveList({
+  openaiApiKey,
+  brand,
+  productName,
+  foodType,
+  category,
+}) {
+  const query = [brand, productName, foodType || category].filter(Boolean).join(" ");
+
+  return openaiJson({
+    openaiApiKey,
+    temperature: 0,
+    maxTokens: 1400,
+    messages: [
+      {
+        role: "system",
+        content: `You look up COMPLETE published US retail ingredient lists for packaged foods.
+You MUST include every ingredient AND every additive / chemical / preservative / emulsifier / color / sweetener that appears on the label — not a shortened “marketing” list.
+
+Sources: brand sites, retailer labels, Open Food Facts–style data, EWG Food Scores, packing disclosures.
+Be specific to THIS brand + this product/food type. Do not borrow another brand’s formula.
+If you know Lesser Evil Himalayan Pink Salt popcorn, list only: organic popcorn, organic extra virgin coconut oil, Himalayan salt — not soybean oil.`,
+      },
+      {
+        role: "user",
+        content: `Look up the FULL ingredient / additive / chemical list for:
+Query: "${query}"
+Brand: ${brand || "(unknown)"}
+Product: ${productName || "(unknown)"}
+Food type: ${foodType || category || "(unknown)"}
+
+Return ONLY JSON:
+{
+  "found": true,
+  "confidence": 0.0,
+  "ingredients_full": ["every ingredient in label order"],
+  "additives_and_chemicals": ["every additive, preservative, color, emulsifier, sweetener, processing aid called out on the label — can overlap ingredients_full"],
+  "ingredients_text": "single comma-separated string of the full label list"
+}
+
+Rules:
+- Always attempt additives_and_chemicals. If the product has none (clean 3-ingredient snack), return [].
+- ingredients_full should be complete when found=true.
+- found=true only if confidence >= 0.75 for this exact brand/SKU family.
+- Never invent TBHQ/soybean oil for a brand known to use coconut oil only.`,
+      },
+    ],
+  });
+}
+
+/**
+ * Step 3 — Walk the WHOLE list, extract unhealthy items, rank each 1–10.
+ */
+async function extractAndRankUnhealthy({
+  openaiApiKey,
+  brand,
+  productName,
+  foodType,
+  ingredientsFull,
+  additivesAndChemicals,
+  ingredientsText,
+}) {
+  const fullList = [
+    ...asStringArray(ingredientsFull),
+    ...asStringArray(additivesAndChemicals),
+  ];
+  const uniqueList = [...new Set(fullList.map((s) => s.trim()).filter(Boolean))];
+
+  return openaiJson({
+    openaiApiKey,
+    temperature: 0,
+    maxTokens: 1600,
+    messages: [
+      {
+        role: "system",
+        content: `You are a clean-label chemist. You are given a FULL ingredient + additives/chemicals list.
+Go through EVERY item. Extract only the unhealthy / ultra-processed ones.
+Rank each bad finding severity 1–10 (10 = worst: e.g. TBHQ, potassium bromate, BHA/BHT, artificial dyes, seed oils in junk food).
+Coconut oil, olive oil, avocado oil, butter, salt, spices, whole foods are NOT unhealthy for this purpose.
+Do not invent items that are not on the provided list.`,
+      },
+      {
+        role: "user",
+        content: `Brand: ${brand || "(unknown)"}
+Product: ${productName || "(unknown)"}
+Food type: ${foodType || "(unknown)"}
+
+FULL INGREDIENTS LIST:
+${uniqueList.length ? uniqueList.map((i, n) => `${n + 1}. ${i}`).join("\n") : "(empty)"}
+
+ADDITIVES / CHEMICALS CALLED OUT:
+${asStringArray(additivesAndChemicals).join(", ") || "(none listed separately)"}
+
+LABEL TEXT:
+${ingredientsText || "(none)"}
+
+Go through the whole list. Extract unhealthy items and rank them.
+
+Return ONLY JSON:
+{
+  "ranked_bad": [
+    {
+      "name": "soybean oil",
+      "kind": "seed_oil",
+      "severity": 7,
+      "why": "industrial seed oil"
+    }
+  ],
+  "seed_oils": ["soybean oil"],
+  "additives": ["TBHQ"],
+  "score": 28,
+  "rating": "Avoid",
+  "analysis_title": "Labely's Analysis",
+  "analysis": "2-4 short sentences. Bold (**like this**) the worst ranked items. Base this on ranked_bad only.",
+  "lawsuits_found": false,
+  "lawsuit_summary": "No lawsuits found."
+}
+
+kind: one of seed_oil | preservative | color | sweetener | emulsifier | flavor_enhancer | additive | other
+severity: 1 (mild concern) … 10 (severe)
+seed_oils / additives: flat lists derived from ranked_bad (seed oils vs everything else)
+If ranked_bad is empty → score 70–95 (Good/Great)
+If any seed_oil → score ≤ 42
+If seed_oil + harsh preservative/dye/sweetener → score ≤ 28
+rating must match score bands.`,
+      },
+    ],
+  });
+}
+
+function scoreFromRanked(ranked, seedOils, additives, modelScore) {
+  const top = ranked[0]?.severity ?? 0;
+  const harsh = ranked.some((r) => r.severity >= 8);
+  const many = ranked.length >= 4;
+  let score = hardenLabelyScore(modelScore, seedOils, additives);
+  if (!ranked.length) {
+    score = Math.max(score, 72);
+  } else if (harsh || (seedOils.length && additives.length)) {
+    score = Math.min(score, 28);
+  } else if (top >= 7 || seedOils.length) {
+    score = Math.min(score, 42);
+  } else if (many || top >= 5) {
+    score = Math.min(score, 55);
+  }
+  return score;
+}
+
+function buildAnalysisFromRanked(ranked, fallbackAnalysis) {
+  if (!ranked.length) {
+    return (
+      String(fallbackAnalysis || "").trim() ||
+      "No concerning additives or industrial seed oils stood out on the published ingredient list."
+    );
+  }
+  const worst = ranked.slice(0, 3);
+  const bolded = worst.map((r) => `**${r.name}**`).join(", ");
+  const detail = worst
+    .map((r) => `${r.name} (risk ${r.severity}/10${r.why ? `: ${r.why}` : ""})`)
+    .join("; ");
+  const base = String(fallbackAnalysis || "").trim();
+  if (base && /\*\*/.test(base)) return base;
+  return `Flagged from the full label scan: ${bolded}. Ranked concerns — ${detail}.`;
+}
+
+function buildResult(identity, listLookup, audit) {
+  const ranked = asRankedFindings(audit?.ranked_bad);
+  const seedOils = asStringArray(
+    audit?.seed_oils?.length
+      ? audit.seed_oils
+      : ranked.filter((r) => r.kind === "seed_oil").map((r) => r.name)
+  );
+  const additives = asStringArray(
+    audit?.additives?.length
+      ? audit.additives
+      : ranked.filter((r) => r.kind !== "seed_oil").map((r) => r.name)
+  );
+
+  const score = scoreFromRanked(ranked, seedOils, additives, audit?.score);
+  const rating = ratingLabelFromScore(score);
+  const lawsuitsFound = audit?.lawsuits_found === true;
+  const lawsuitSummary = lawsuitsFound
+    ? String(audit?.lawsuit_summary ?? "").trim() ||
+      "Lawsuits found related to this product."
+    : "No lawsuits found.";
+
+  let analysisText = buildAnalysisFromRanked(ranked, audit?.analysis);
+  if (lawsuitsFound && !/\blawsuit/i.test(analysisText)) {
+    analysisText = `${analysisText} ${lawsuitSummary}`.trim();
+  }
+
+  const ingredientsText =
+    String(listLookup?.ingredients_text || "").trim() ||
+    asStringArray(listLookup?.ingredients_full).join(", ");
+
+  return {
+    name:
+      String(identity?.product_name || identity?.name || "Product").trim() ||
+      "Product",
+    brand: String(identity?.brand ?? "").trim(),
+    foodType: String(identity?.food_type || identity?.category || "").trim(),
+    score,
+    verdict: rating,
+    analysisTitle:
+      String(audit?.analysis_title ?? "").trim() || "Labely\u2019s Analysis",
+    analysis: analysisText,
+    labelyLegalNote: lawsuitSummary,
+    lawsuitsFound,
+    seedOils,
+    additives,
+    rankedBad: ranked,
+    ingredientsSummary: ingredientsText,
+    ingredientsFull: asStringArray(listLookup?.ingredients_full),
+    additivesAndChemicals: asStringArray(listLookup?.additives_and_chemicals),
+    confidence: Number(listLookup?.confidence) || 0,
+    researchSource: "brand-food-full-list-audit",
+  };
+}
+
+/**
+ * ONLY pipeline:
+ * 1) Identify brand + food type from photo
+ * 2) Look up FULL ingredients + additives/chemicals list
+ * 3) Walk whole list → extract unhealthy → rank each → score
+ */
+async function analyzePackagingImage({ imageDataUrl, openaiApiKey, uploadHint = "" }) {
+  if (!openaiApiKey?.trim()) {
+    throw new Error("OPENAI_API_KEY is not set in .env.local");
+  }
+
+  const identity = await identifyBrandAndFoodType({
+    imageDataUrl,
+    openaiApiKey,
+    uploadHint,
+  });
+
+  const brand = String(identity?.brand ?? "").trim();
+  const productName = String(identity?.product_name ?? identity?.name ?? "").trim();
+  const foodType = String(identity?.food_type ?? "").trim();
+  const category = String(identity?.category ?? "").trim();
+
+  if (!brand && !productName) {
+    throw new Error("Could not identify a brand or product from this photo.");
+  }
+
+  const listLookup = await lookupFullIngredientAndAdditiveList({
+    openaiApiKey,
+    brand,
+    productName,
+    foodType,
+    category,
+  });
+
+  const audit = await extractAndRankUnhealthy({
+    openaiApiKey,
+    brand,
+    productName,
+    foodType: foodType || category,
+    ingredientsFull: listLookup?.ingredients_full,
+    additivesAndChemicals: listLookup?.additives_and_chemicals,
+    ingredientsText: listLookup?.ingredients_text,
+  });
+
+  return buildResult(
+    { brand, product_name: productName || "Product", food_type: foodType, category },
+    listLookup,
+    audit
+  );
 }
 
 export async function POST(req) {
@@ -229,7 +398,8 @@ export async function POST(req) {
       body = {};
     }
 
-    const imageDataUrl = typeof body.imageDataUrl === "string" ? body.imageDataUrl.trim() : "";
+    const imageDataUrl =
+      typeof body.imageDataUrl === "string" ? body.imageDataUrl.trim() : "";
     const uploadHint = sanitizeUploadHint(body.uploadHint);
 
     if (!imageDataUrl) {
@@ -239,15 +409,30 @@ export async function POST(req) {
       );
     }
 
-    const analyzed = await analyzePackagingImage({ imageDataUrl, openaiApiKey, uploadHint });
+    const analyzed = await analyzePackagingImage({
+      imageDataUrl,
+      openaiApiKey,
+      uploadHint,
+    });
+
     return NextResponse.json({
       name: analyzed.name,
       brand: analyzed.brand,
+      foodType: analyzed.foodType,
       score: analyzed.score,
       verdict: analyzed.verdict,
       analysisTitle: analyzed.analysisTitle,
       analysis: analyzed.analysis,
       labelyLegalNote: analyzed.labelyLegalNote,
+      lawsuitsFound: analyzed.lawsuitsFound,
+      seedOils: analyzed.seedOils,
+      additives: analyzed.additives,
+      rankedBad: analyzed.rankedBad,
+      ingredientsSummary: analyzed.ingredientsSummary,
+      ingredientsFull: analyzed.ingredientsFull,
+      additivesAndChemicals: analyzed.additivesAndChemicals,
+      confidence: analyzed.confidence,
+      ingredientsSource: analyzed.researchSource,
     });
   } catch (err) {
     console.error("[labely]", err);
