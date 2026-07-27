@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server";
 import { ratingLabelFromScore, hardenLabelyScore } from "@/lib/labelyRating";
 
-export const maxDuration = 120;
+/** Multi-step OpenAI + lookup; keep ≤60s for Vercel Hobby. */
+export const maxDuration = 60;
 
 const OPENAI_CHAT = "https://api.openai.com/v1/chat/completions";
 

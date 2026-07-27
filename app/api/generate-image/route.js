@@ -1,5 +1,8 @@
 import { NextResponse } from "next/server";
 
+/** Coin ID / pricing calls; keep ≤60s for Vercel Hobby. */
+export const maxDuration = 60;
+
 const OPENAI_CHAT = "https://api.openai.com/v1/chat/completions";
 
 /** Turn noisy titles / filenames into short collector-friendly US coin names. */

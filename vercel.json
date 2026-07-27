@@ -1,0 +1,15 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "nextjs",
+  "functions": {
+    "app/api/labely/route.js": {
+      "maxDuration": 60
+    },
+    "app/api/generate-image/route.js": {
+      "maxDuration": 60
+    },
+    "app/api/convert-heic/route.js": {
+      "maxDuration": 30
+    }
+  }
+}
