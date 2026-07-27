@@ -136,6 +136,7 @@ export default function ProductScreenshotApp() {
   const [slot, setSlot] = useState(emptyLabelySlot);
   const [busy, setBusy] = useState(false);
   const [exporting, setExporting] = useState(false);
+  const [muteEffects, setMuteEffects] = useState(false);
   const [status, setStatus] = useState("");
   const [error, setError] = useState("");
   const [dragOver, setDragOver] = useState(false);
@@ -372,9 +373,11 @@ export default function ProductScreenshotApp() {
             })();
 
       setStatus(
-        isGoodLabelyScore(score)
-          ? "Recording scan → slide-up + yay…"
-          : "Recording scan → slide-up + sound…"
+        muteEffects
+          ? "Recording scan → slide-up (no sound/memes)…"
+          : isGoodLabelyScore(score)
+            ? "Recording scan → slide-up + yay…"
+            : "Recording scan → slide-up + sound…"
       );
 
       const blob = await exportZoomVideo({
@@ -386,12 +389,13 @@ export default function ProductScreenshotApp() {
         additives: slot.labelyAdditives,
         analysisTitle: slot.labelyAnalysisTitle || "Labely's Analysis",
         analysisText: slot.labelyAnalysis || "",
+        muteEffects,
         onProgress: (pct, phase, cueLabel) => {
           if (phase === "encoding") {
             setStatus(`Encoding MP4… ${pct}%`);
             return;
           }
-          const cue = cueLabel ? ` (${cueLabel})` : "";
+          const cue = !muteEffects && cueLabel ? ` (${cueLabel})` : "";
           setStatus(`Recording video… ${pct}%${cue}`);
         },
       });
@@ -410,7 +414,7 @@ export default function ProductScreenshotApp() {
     } finally {
       setExporting(false);
     }
-  }, [brand, captureFullFrameDataUrl, slot]);
+  }, [brand, captureFullFrameDataUrl, muteEffects, slot]);
 
   const hasResult = Boolean(slot.imageUrl && (slot.itemName || slot.labelyAnalysis));
 
@@ -527,6 +531,22 @@ export default function ProductScreenshotApp() {
               onChange={onPickFile}
             />
           </div>
+
+          <label className="mt-4 flex cursor-pointer items-start gap-2.5 text-[13px] leading-snug text-[#5c5c5c]">
+            <input
+              type="checkbox"
+              checked={muteEffects}
+              disabled={exporting}
+              onChange={(e) => setMuteEffects(e.target.checked)}
+              className="mt-0.5 h-4 w-4 accent-[#1a1a1a]"
+            />
+            <span>
+              Remove sound effects &amp; meme images
+              <span className="mt-0.5 block text-[12px] text-[#8e8e93]">
+                Video keeps scan → slide-up only (no stingers, vine boom, or dog overlays).
+              </span>
+            </span>
+          </label>
 
           {status ? (
             <p className="mt-4 text-[13px] font-medium text-[#2F5A41]">{status}</p>
